@@ -1,0 +1,118 @@
+json
+{
+  "candidate": {
+    "name": "Rahul Kumar",
+    "email": "rahul.kumar.pg24@nsut.ac.in"
+  },
+  "section_a": {
+    "bugs": [
+      {
+        "bug": "Data leakage in `load_and_prepare_data` via global imputation. The function calculates `df.mean()` on the entire dataset before any train/test split.",
+        "ml_concept": "Data Leakage",
+        "manifestation": "The model sees information (global mean) from the test set during training, resulting in validation scores that are artificially inflated and do not reflect real-world performance.",
+        "fix": "Split the data into train and test sets first. Calculate imputation values (e.g., mean) using only the training set, then apply these values to transform both the train and test sets."
+      },
+      {
+        "bug": "Severe data drift in `create_features` using `pd.Timestamp.now()`. Features like 'account_age_days' and 'days_since_last_activity' are calculated relative to the current execution date.",
+        "ml_concept": "Non-Stationarity / Training-Serving Skew",
+        "manifestation": "Feature values change drastically every day the script runs. A model trained today will see vastly different numbers (e.g., account age in days) when used in production tomorrow, breaking the model's decision boundaries.",
+        "fix": "Calculate time-based features relative to a fixed reference date (e.g., the snapshot date of the dataset) or relative to the event timestamps provided in the data row itself, not the current system time."
+      },
+      {
+        "bug": "Incorrect preprocessing in `train_model` using `scaler.fit_transform(X_test)`. The scaler is refit on the test data.",
+        "ml_concept": "Data Leakage",
+        "manifestation": "This allows the model to 'cheat' by learning the specific distribution (mean/variance) of the test set. In production, the scaler only knows the training distribution, causing predictions to be inaccurate.",
+        "fix": "Use `scaler.transform(X_test)` to apply the scaling parameters learned solely from the training data."
+      },
+      {
+        "bug": "Training-Serving Skew in `predict_churn`. The function does not apply the saved `label_encoders` to the new input data.",
+        "ml_concept": "Training-Serving Skew",
+        "manifestation": "The model was trained on numerical representations of categories (e.g., 0, 1). In production, if `new_data` contains raw strings (e.g., 'Male', 'Female'), the scaler will throw an error or the model will make garbage predictions.",
+        "fix": "Load the encoders from the joblib file and explicitly `transform` the categorical columns in `new_data` before scaling."
+      },
+      {
+        "bug": "Dimensionality mismatch in `predict_churn`. The raw `new_data` includes columns ('signup_date', 'customer_id') that were dropped during training.",
+        "ml_concept": "Input Validation / Shape Mismatch",
+        "manifestation": "The `scaler` expects a specific number of features (matching `X_train`). Passing extra columns causes a shape mismatch error or forces the scaler to fit on incorrect data dimensions.",
+        "fix": "Ensure `new_data` is processed to match the exact feature set used in training. Drop date and ID columns before transforming."
+      },
+      {
+        "bug": "Numerical instability in `create_features`. Division by zero errors are not handled for `revenue_per_login` and `support_to_login_ratio`.",
+        "ml_concept": "Data Robustness",
+        "manifestation": "If a user has 0 logins, these features become `inf` or `NaN`. This can break the StandardScaler (which doesn't handle `inf` well) or cause the tree model to behave unpredictably.",
+        "fix": "Add logic to handle division by zero, e.g., replacing the result with 0 or filling with the median value."
+      }
+    ]
+  },
+  "section_b": {
+    "diagnosis": "The root cause is a Prior Probability Shift (or Label Distribution Shift). The fraud rate in the training data (2.1%) is roughly 14x higher than in production (0.15%). The model learned a decision boundary optimized for a high-risk environment where 'fraud' is common. In production, because fraud is so rare, the model's fixed threshold (likely 0.5) is too aggressive, flagging many legitimate transactions as fraudulent. While the model correctly identifies almost all actual frauds (High Recall), it generates an overwhelming number of False Positives relative to the tiny number of True Positives, causing Precision to collapse.",
+    "metric_analysis": "Accuracy remains high (97.1%) primarily because the metric is misleading in highly imbalanced datasets. Since 99.85% of transactions are legitimate, a model that blindly predicts 'Legit' for everyone would achieve 99.85% accuracy. The current model's 97.1% accuracy indicates it is performing worse than a dummy classifier. Precision collapsed to 12.3% because the model is casting a very wide net; for every 1 actual fraudster caught, roughly 7 innocent users are falsely accused.",
+    "immediate_actions": [
+      "Immediately increase the classification threshold (e.g., from 0.5 to 0.9) to reduce False Positives and restore precision to an acceptable level.",
+      "Disable automated blocking of transactions if it is active; switch to 'manual review' mode for flagged transactions to minimize business impact.",
+      "Slice the production data to analyze if the performance drop is uniform across all segments or specific to certain merchants/user types."
+    ],
+    "long_term_fixes": "Redesign the pipeline to be robust to distribution shifts. This includes: 1) Implementing importance weighting during training to simulate the expected production prior (0.15%), 2) Using cost-sensitive learning where False Positives are penalized much more heavily than False Negatives during model training, 3) Establishing a monitoring system that alerts on significant shifts in feature distributions and prediction drifts, and 4) Retraining the model regularly on the most recent data to adapt to evolving patterns.",
+    "threshold_tuning": "Threshold selection should not be a purely technical optimization of F1 score. It requires a cost-benefit analysis. We must define the 'Cost of a False Positive' (e.g., customer churn, support ticket cost, lost revenue from blocking a valid user) versus the 'Cost of a False Negative' (e.g., monetary loss from fraud). The optimal threshold is the point where the expected financial loss (Cost_FP * FP_Count + Cost_FN * FN_Count) is minimized. If blocking a user is expensive, we choose a higher threshold to prioritize Precision."
+  },
+  "section_c": {
+    "architecture": "The system follows a Retrieval-Ranking architecture. 1. **Retrieval Service**: A candidate generation model (Two-Tower DSSM or Matrix Factorization) retrieves ~500 candidate items from a catalog of millions using Approximate Nearest Neighbor (ANN) search (Faiss/HNSW) in under 10ms. 2. **Ranking Service**: A more complex model (XGBoost or DeepFM) scores the 500 candidates using rich features (user history, real-time session, item metadata). 3. **Re-ranking**: Business rules (diversity, stock availability) are applied to the final Top-10 list.",
+    "models": "For candidate generation, I recommend a **Two-Tower Neural Network** (User Tower & Item Tower) because it supports real-time inference and handles cold starts better than pure matrix factorization by embedding item features. For the ranking stage, **Gradient Boosted Decision Trees (XGBoost/LightGBM)** are preferred for their ability to handle tabular data and interpretability.",
+    "feature_store": "Features are split into Batch and Real-time. **Batch features** (e.g., 'user_avg_spend_30d', 'item_global_popularity') are precomputed daily using Spark/Hive and stored in a low-latency store like Redis or Cassandra. **Real-time features** (e.g., 'last_5_clicked_categories', 'time_on_page') are computed on the fly from the user's event stream (Kafka). Consistency is ensured by using a single feature definition framework (e.g., Feast) that guarantees the logic used during training (point-in-time joins) matches the logic used during serving.",
+    "cold_start": "**New Users**: We rely on heuristic rules and popularity-based recommendations ('Trending Now', 'Best Sellers'). As the user interacts (clicks/purchases), we immediately switch to a session-based collaborative filtering approach or content-based filtering based on the items they viewed. **New Products**: We use content-based filtering to generate embeddings from the product text/images, mapping the new item to similar known items (e.g., 'Users who bought red shoes also bought...').",
+    "evaluation": "**Offline Metrics**: We optimize for Recall@K (to ensure good retrieval) and NDCG (to measure ranking quality) on a held-out historical dataset. **Online Metrics**: The ultimate success metrics are Click-Through Rate (CTR), Conversion Rate (CR), and Total Revenue. **A/B Testing**: We divert a small percentage of traffic (e.g., 5%) to the new model. We run the test for a minimum of 2 weeks to account for weekly seasonality and measure statistical significance on revenue impact.",
+    "failure_modes": "If the **ML model is down**, the request fails over to a cached list of 'Popular Items' or static rule-based recommendations (fallback). If **feature computation is delayed**, the system serves the request using stale features (e.g., user profile from 24 hours ago) rather than timing out. Model degradation is detected by monitoring the CTR in real-time; if the live CTR drops below a threshold relative to the control group, the old model is automatically rolled back."
+  },
+  "section_d": {
+    "issues": [
+      {
+        "category": "performance",
+        "problem": "Embedding loop inside `load_documents` encodes chunks one by one in a `for` loop.",
+        "impact": "Ingestion will be painfully slow for large documents. The SentenceTransformer library supports batch encoding, which is orders of magnitude faster.",
+        "fix": "Remove the loop and use `encoder.encode(chunks, batch_size=32, show_progress_bar=True)` to encode all chunks at once."
+      },
+      {
+        "category": "chunking",
+        "problem": "Chunking strategy splits by fixed word count (200 words) without overlap.",
+        "impact": "This leads to context loss where critical information is split across chunks arbitrarily (e.g., a sentence cut in half). The retriever may fail to find relevant context because the semantic meaning is broken.",
+        "fix": "Use a semantic chunking strategy or at least a sentence-based tokenizer with overlap (e.g., 50 words overlap) to preserve context boundaries."
+      },
+      {
+        "category": "error",
+        "problem": "`chat_stream` attempts to access `self.response_cache` which is never initialized in `__init__`.",
+        "impact": "Any call to `chat_stream` will raise an `AttributeError` and crash the application.",
+        "fix": "Initialize `self.response_cache = {}` inside the `__init__` method."
+      },
+      {
+        "category": "performance",
+        "problem": "No limit on `conversation_history` length in the `chat` function.",
+        "impact": "As the conversation progresses, the token count sent to the API will exceed the model's context window, causing API failures (400 errors) or unnecessary high costs.",
+        "fix": "Implement a sliding window or summarization logic to keep only the last N messages (e.g., last 5 turns) before sending to the LLM."
+      },
+      {
+        "category": "prompt",
+        "problem": "System prompt does not strictly forbid hallucinations or reference the context properly.",
+        "impact": "The LLM may use its internal pre-trained knowledge to answer questions, leading to answers that are factually correct in general but not present in the specific knowledge base provided.",
+        "fix": "Update the system prompt to: 'Answer the user's question using ONLY the context provided below. If the answer is not in the context, state that you do not know.'"
+      },
+      {
+        "category": "retrieval",
+        "problem": "Retrieval in `get_context` has no score threshold filtering.",
+        "impact": "If the user asks a question completely unrelated to the documents, the system will still return the top 3 chunks (even if they are terrible matches) and force the LLM to answer them, resulting in nonsensical outputs.",
+        "fix": "Filter out results where the cosine distance/similarity score is below a certain confidence threshold."
+      },
+      {
+        "category": "error",
+        "problem": "File reading `open(path, 'r')` does not specify an encoding.",
+        "impact": "If the file contains non-UTF8 characters (common in different OS environments), the script will crash with a `UnicodeDecodeError`.",
+        "fix": "Specify encoding explicitly, e.g., `open(path, 'r', encoding='utf-8')`."
+      },
+      {
+        "category": "caching",
+        "problem": "Cache keys are generated using MD5 of the user message only.",
+        "impact": "The cache ignores the conversation history. A user asking 'What is the price?' in different contexts (different products) will get the same cached answer, which is likely incorrect.",
+        "fix": "The cache key should be a hash of the recent conversation history + the current query, or disable caching for conversational flows to avoid staleness."
+      }
+    ]
+  }
+}
